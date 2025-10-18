@@ -83,7 +83,11 @@ function saveWeights() {
 
 
 // --- WebSocket Server for Frontend ---
-const server = http.createServer();
+const server = http.createServer((req, res) => {
+    // Basic HTTP response to satisfy health checks
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Medusir Backend is running.');
+});
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', ws => {
@@ -310,7 +314,8 @@ connectToDeriv();
 startPredictionCycles();
 setInterval(checkPortfolioRisk, 10000); // Check portfolio risk every 10 seconds
 
-server.listen(8080, () => {
-    console.log('Medusir 5.1 Backend is running on port 8080');
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+    console.log(`Medusir 5.1 Backend is running on port ${PORT}`);
 });
 
