@@ -1,4 +1,4 @@
-// Medusir 3.1 - Backend Predictive Engine (Pre-Trained Hybrid)
+// Medusir 3.2 - Backend Predictive Engine (Dynamic Probability)
 // Developed by FrostyMedusir
 
 const WebSocket = require('ws');
@@ -16,33 +16,23 @@ const ANALYSIS_TICKS = 100;
 const STABILITY_ANALYSIS_TICKS = 150;
 const ENTRY_WINDOW_SECONDS = 5;
 const KALMAN_R = 0.01, KALMAN_Q = 0.1;
-const ATR_PERIOD = 14;
-const LOSS_STREAK_THRESHOLD = 3;
-const COOLDOWN_PERIOD_MS = 5 * 60 * 1000;
-const RISK_OFF_THRESHOLD = 3;
+const CERTAINTY_THRESHOLD = 1.5; // Top score must be 50% higher than the next best
 
-// --- Pre-trained Weights from Historical Records ---
-const PRE_TRAINED_WEIGHTS = {
-    TRENDING: { ldf: 0.6, recency: 0.8, pf: 1.5, stoch: 0.7 },
-    REVERTING: { ldf: 1.4, recency: 1.2, pf: 0.6, stoch: 1.1 },
-    BALANCED: { ldf: 1.0, recency: 1.0, pf: 1.0, stoch: 1.0 }
-};
+// --- Initial Weights from Historical Records ---
+const INITIAL_WEIGHTS = { ldf: 1.0, recency: 1.0, pf: 1.0 };
 
 let instruments = {};
-let portfolioRiskMode = 'NORMAL';
 
 // --- Initialization ---
 function initializeInstruments() {
-    console.log("Initializing Medusir 3.1 Engine...");
+    console.log("Initializing Medusir 3.2 Engine...");
     const savedWeights = loadWeights();
     for (const symbol in VOLATILITY_INDEXES) {
         instruments[symbol] = {
             symbol,
-            priceHistory: { high: [], low: [], close: [] },
-            smoothedPriceHistory: [],
+            priceHistory: [],
             kalmanState: { x: null, p: 1 },
-            weights: savedWeights[symbol] || { ...PRE_TRAINED_WEIGHTS.BALANCED },
-            marketPersona: 'BALANCED',
+            weights: savedWeights[symbol] || { ...INITIAL_WEIGHTS },
             activeSignal: null,
             lossStreak: 0,
             cooldownUntil: null,
@@ -58,7 +48,7 @@ function loadWeights() {
             const data = fs.readFileSync(WEIGHTS_FILE, 'utf8');
             return JSON.parse(data);
         }
-        console.log("No records found. Starting with pre-trained intelligence.");
+        console.log("No records found. Starting with initial intelligence.");
         return {};
     } catch (e) {
         console.error("Error loading weights file, starting fresh:", e.message);
@@ -81,7 +71,7 @@ function saveWeights() {
 // --- Server & Comms ---
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Medusir 3.1 Backend is running.');
+    res.end('Medusir 3.2 Backend is running.');
 });
 const wss = new WebSocket.Server({ server });
 
@@ -117,19 +107,12 @@ function handleTick(tick) {
     const instrument = instruments[symbol];
     const newPrice = tick.quote;
 
-    // Update price history for all indicators
-    const lastClose = instrument.priceHistory.close.length > 0 ? instrument.priceHistory.close[instrument.priceHistory.close.length - 1] : newPrice;
-    instrument.priceHistory.high.push(Math.max(lastClose, newPrice));
-    instrument.priceHistory.low.push(Math.min(lastClose, newPrice));
-    instrument.priceHistory.close.push(newPrice);
-    
-    // Smooth data with Kalman Filter
+    // Smooth data with Kalman Filter and update history
     const smoothedPrice = kalmanUpdate(instrument.kalmanState, newPrice);
-    instrument.smoothedPriceHistory.push(smoothedPrice);
+    instrument.priceHistory.push(smoothedPrice);
 
-    if (instrument.priceHistory.close.length > STABILITY_ANALYSIS_TICKS + 5) {
-       Object.keys(instrument.priceHistory).forEach(key => instrument.priceHistory[key].shift());
-       instrument.smoothedPriceHistory.shift();
+    if (instrument.priceHistory.length > STABILITY_ANALYSIS_TICKS + 5) {
+       instrument.priceHistory.shift();
     }
     
     broadcast({ type: 'tick', symbol, digit: newPrice.toFixed(2).slice(-1) });
@@ -140,142 +123,160 @@ function handleTick(tick) {
 
 function runAnalysis(symbol) {
     const instrument = instruments[symbol];
-    if (instrument.activeSignal) return; // Don't analyze if a signal is already active
+    if (instrument.activeSignal) return; 
 
-    if (instrument.cooldownUntil && Date.now() < instrument.cooldownUntil) {
-        broadcast({ type: 'status', symbol, status: 'COOLING DOWN', persona: instrument.marketPersona });
-        return;
-    }
-    if(instrument.cooldownUntil) {
-        instrument.cooldownUntil = null; instrument.lossStreak = 0;
-        console.log(`Instrument ${symbol} has cooled down. Resuming analysis.`);
-    }
-
-    const prediction = getAIConfluencePrediction(symbol);
+    const prediction = getAIProbabilityPrediction(symbol);
 
     if (prediction.signal === 'CONFIRMED') {
         instrument.activeSignal = {
             predictedDigit: prediction.digit,
-            modelsUsed: prediction.modelsUsed,
+            modelScores: prediction.modelScores,
             entryTime: Date.now()
         };
         broadcast({
             type: 'signal', symbol, digit: prediction.digit,
-            confidence: prediction.confidence, models: prediction.modelsUsed, persona: instrument.marketPersona
+            confidence: prediction.confidence, models: prediction.topModels
         });
         setTimeout(() => {
-            backtestAndLearn(symbol);
-            instrument.activeSignal = null;
+            if (instrument.activeSignal) {
+                backtestAndLearn(symbol);
+                instrument.activeSignal = null;
+            }
         }, ENTRY_WINDOW_SECONDS * 1000);
     } else {
-         broadcast({ type: 'status', symbol, status: 'ANALYZING', persona: instrument.marketPersona, reason: prediction.reason });
+         broadcast({ type: 'status', symbol, status: 'ANALYZING', reason: prediction.reason });
     }
 }
 
 // --- AI Engine & Helpers ---
-function getAIConfluencePrediction(symbol) { 
-    const instrument = instruments[symbol]; 
-    if (instrument.smoothedPriceHistory.length < ANALYSIS_TICKS) return { signal: 'HOLD', reason: 'Calibrating...' }; 
+function getAIProbabilityPrediction(symbol) {
+    const instrument = instruments[symbol];
+    if (instrument.priceHistory.length < ANALYSIS_TICKS) return { signal: 'HOLD', reason: 'Calibrating...' };
 
-    const marketPersona = detectMarketPersona(instrument.priceHistory); 
-    instrument.marketPersona = marketPersona; 
+    const lastDigits = instrument.priceHistory.map(price => parseInt(price.toFixed(2).slice(-1)));
     
-    if (marketPersona === 'ERRATIC') return { signal: 'HOLD', reason: 'Erratic Market' }; 
+    const isStable = getVolatilityCheck(lastDigits);
+    if (!isStable) return { signal: 'HOLD', reason: 'Market too volatile' };
     
-    instrument.weights = PRE_TRAINED_WEIGHTS[marketPersona];
-    const requiredConfluence = portfolioRiskMode === 'RISK_OFF' ? 4 : 3;
+    // --- Feature Scoring ---
+    const ldfScores = getLDFScores(lastDigits);
+    const recencyScores = getRecencyScores(lastDigits);
+    const pfScores = getPairingFrequencyScores(lastDigits);
 
-    const lastDigits = instrument.smoothedPriceHistory.map(price => parseInt(price.toFixed(2).slice(-1))); 
-    const experts = [
-        getLDFPrediction(lastDigits), 
-        getRecencyPrediction(lastDigits), 
-        getPairingFrequencyPrediction(lastDigits), 
-        getStochasticPrediction(instrument.priceHistory)
-    ];
-    
-    const predictions = {}; 
-    experts.forEach(p => { 
-        if (p && p.digit !== null) { 
-            if (!predictions[p.digit]) predictions[p.digit] = { score: 0, models: [] }; 
-            predictions[p.digit].score += p.score * instrument.weights[p.model]; 
-            predictions[p.digit].models.push(p.model.toUpperCase()); 
-        } 
-    }); 
+    // --- Weighted Aggregation ---
+    const finalScores = Array(10).fill(0);
+    for (let i = 0; i < 10; i++) {
+        finalScores[i] += ldfScores[i] * instrument.weights.ldf;
+        finalScores[i] += recencyScores[i] * instrument.weights.recency;
+        finalScores[i] += pfScores[i] * instrument.weights.pf;
+    }
 
-    let bestDigit = null, maxScore = -Infinity, finalModels = []; 
-    for (const digit in predictions) { 
-        if (predictions[digit].models.length >= requiredConfluence && predictions[digit].score > maxScore) { 
-            maxScore = predictions[digit].score; 
-            bestDigit = parseInt(digit); 
-            finalModels = predictions[digit].models; 
-        } 
-    } 
-    if (bestDigit !== null) { 
-        const confidence = Math.min(99, Math.floor(60 + maxScore / 10)); 
-        return { signal: 'CONFIRMED', digit: bestDigit, confidence: confidence, modelsUsed: finalModels }; 
-    } 
-    return { signal: 'HOLD', reason: 'No Confluence' }; 
+    // --- Certainty Threshold ---
+    const sortedScores = [...finalScores].map((score, index) => ({ score, index })).sort((a, b) => b.score - a.score);
+    const best = sortedScores[0];
+    const runnerUp = sortedScores[1];
+
+    if (best.score > runnerUp.score * CERTAINTY_THRESHOLD) {
+        const confidence = Math.min(99, Math.floor(50 + (best.score - runnerUp.score) * 2));
+        const topModels = [
+            { score: ldfScores[best.index], name: 'LDF'},
+            { score: recencyScores[best.index], name: 'RECENCY'},
+            { score: pfScores[best.index], name: 'PF'}
+        ].sort((a,b) => b.score - a.score).slice(0,2).map(m => m.name);
+
+        return {
+            signal: 'CONFIRMED',
+            digit: best.index,
+            confidence: confidence,
+            topModels: topModels,
+            modelScores: { ldf: ldfScores, recency: recencyScores, pf: pfScores }
+        };
+    }
+
+    return { signal: 'HOLD', reason: 'No High-Certainty Signal' };
 }
 
-function detectMarketPersona(priceHistory) { /* ... same as before ... */ }
-function getLDFPrediction(digits) { /* ... same as before ... */ }
-function getRecencyPrediction(digits) { /* ... same as before ... */ }
-function getPairingFrequencyPrediction(digits) { /* ... same as before ... */ }
-function getStochasticPrediction(priceHistory) { /* ... same as before ... */ }
-function kalmanUpdate(state, z) { /* ... same as before ... */ }
-function detectMarketPersona(priceHistory) { const slice = priceHistory.close.slice(-50); if (slice.length < 50) return 'BALANCED'; const mean = slice.reduce((a, b) => a + b, 0) / slice.length; const stdDev = Math.sqrt(slice.map(x => Math.pow(x - mean, 2)).reduce((a, b) => a + b) / slice.length); const relativeStdDev = stdDev / mean; if (relativeStdDev > 0.0008) return 'ERRATIC'; if (relativeStdDev < 0.0003) return 'REVERTING'; return 'TRENDING'; }
-function getLDFPrediction(digits) { const counts = Array(10).fill(0); digits.slice(-50).forEach(d => counts[d]++); const min = Math.min(...counts); const digit = counts.indexOf(min); const score = 100 - (min/50*100*2); return { digit, score, model: 'ldf' }; }
-function getRecencyPrediction(digits) { let scores = []; for (let i=0; i<=9; i++) { scores[i] = digits.lastIndexOf(i); } const min = Math.min(...scores); const digit = scores.indexOf(min); const score = (digits.length - min) / ANALYSIS_TICKS * 50; return { digit, score, model: 'recency' }; }
-function getPairingFrequencyPrediction(digits) { const last = digits[digits.length-1]; const transitions = {}; for(let i=0; i<digits.length-1; i++) { if (digits[i] === last) { const next = digits[i+1]; transitions[next] = (transitions[next] || 0) + 1; } } let mostCommon = null, max = -1; for(let i=0;i<=9;i++){ if((transitions[i]||0) > max){ max = transitions[i]||0; mostCommon = i; } } return { digit: mostCommon, score: max*10, model: 'pf' }; }
-function getStochasticPrediction(priceHistory) { const period = 14; if (priceHistory.close.length < period) return null; const highs = priceHistory.high.slice(-period); const lows = priceHistory.low.slice(-period); const highestHigh = Math.max(...highs); const lowestLow = Math.min(...lows); const k = ((priceHistory.close[priceHistory.close.length-1] - lowestLow) / (highestHigh-lowestLow)) * 100; if (k < 10) return {digit: parseInt(lowestLow.toFixed(2).slice(-1)), score: 30, model: 'stoch'}; if (k > 90) return {digit: parseInt(highestHigh.toFixed(2).slice(-1)), score: 30, model: 'stoch'}; return null; }
+function getLDFScores(digits) {
+    const counts = Array(10).fill(0);
+    digits.forEach(d => counts[d]++);
+    const maxCount = Math.max(...counts);
+    return counts.map(count => (maxCount - count) * 1.5); 
+}
+
+function getRecencyScores(digits) {
+    const scores = Array(10).fill(0);
+    for (let i=0; i<10; i++) {
+        const lastSeen = digits.lastIndexOf(i);
+        scores[i] = lastSeen === -1 ? ANALYSIS_TICKS : digits.length - 1 - lastSeen;
+    }
+    return scores;
+}
+
+function getPairingFrequencyScores(digits) {
+    const last = digits[digits.length - 1];
+    const transitions = Array(10).fill(0);
+    for (let i = 0; i < digits.length - 1; i++) {
+        if (digits[i] === last) {
+            transitions[digits[i+1]]++;
+        }
+    }
+    const maxTransition = Math.max(...transitions);
+    return transitions.map(count => (count / (maxTransition || 1)) * 30); 
+}
+
+function getVolatilityCheck(digits) { 
+    const slice = digits.slice(-30); 
+    const mean = slice.reduce((a,b)=>a+b,0) / slice.length; 
+    const stdDev = Math.sqrt(slice.map(x => Math.pow(x-mean, 2)).reduce((a,b) => a+b) / slice.length); 
+    return stdDev < 2.85; 
+}
 function kalmanUpdate(state, z) { if (state.x === null) { state.x = z; } const p_pred = state.p + KALMAN_R; const K = p_pred / (p_pred + KALMAN_Q); state.x = state.x + K * (z - state.x); state.p = (1 - K) * p_pred; return state.x; }
 
 function backtestAndLearn(symbol) {
     const instrument = instruments[symbol];
     if (!instrument.activeSignal) return;
 
-    const finalPrice = instrument.priceHistory.close[instrument.priceHistory.close.length - 1];
+    const finalPrice = instrument.priceHistory[instrument.priceHistory.length - 1];
     const finalDigit = parseInt(finalPrice.toFixed(2).slice(-1));
-    const { predictedDigit, modelsUsed } = instrument.activeSignal;
+    const { predictedDigit, modelScores } = instrument.activeSignal;
     const wasCorrect = finalDigit === predictedDigit;
-    const adj = 0.1;
+    const adj = 0.05;
+
+    // Check which models were "most correct" for the actual outcome
+    const finalScores = [
+        { model: 'ldf', score: modelScores.ldf[finalDigit] },
+        { model: 'recency', score: modelScores.recency[finalDigit] },
+        { model: 'pf', score: modelScores.pf[finalDigit] },
+    ].sort((a, b) => b.score - a.score);
 
     if (wasCorrect) {
-        instrument.lossStreak = 0;
-        console.log(`✅ WIN on ${symbol}. Predicted: ${predictedDigit}. Actual: ${finalDigit}. Reinforcing ${modelsUsed.join(', ')}.`);
-        modelsUsed.forEach(model => { instrument.weights[model.toLowerCase()] += adj; });
+        console.log(`✅ WIN on ${symbol}. Predicted: ${predictedDigit}. Actual: ${finalDigit}.`);
+        // Reinforce the model that had the highest score for the CORRECT digit
+        instrument.weights[finalScores[0].model] += adj * 2;
+        instrument.weights[finalScores[1].model] += adj;
     } else {
-        instrument.lossStreak++;
-        console.log(`❌ LOSS on ${symbol}. Predicted: ${predictedDigit}. Actual: ${finalDigit}. Penalizing ${modelsUsed.join(', ')}.`);
-        modelsUsed.forEach(model => { instrument.weights[model.toLowerCase()] -= adj; });
-    }
-    
-    if (instrument.lossStreak >= LOSS_STREAK_THRESHOLD) {
-        instrument.cooldownUntil = Date.now() + COOLDOWN_PERIOD_MS;
-        console.log(`-- ${symbol} deactivated. Cooling down for 5 minutes. --`);
+        console.log(`❌ LOSS on ${symbol}. Predicted: ${predictedDigit}. Actual: ${finalDigit}.`);
+        // Penalize the model that had the highest score for the WRONG (predicted) digit
+        const predictedScores = [
+            { model: 'ldf', score: modelScores.ldf[predictedDigit] },
+            { model: 'recency', score: modelScores.recency[predictedDigit] },
+            { model: 'pf', score: modelScores.pf[predictedDigit] },
+        ].sort((a, b) => b.score - a.score);
+        instrument.weights[predictedScores[0].model] -= adj * 2;
     }
 
     Object.keys(instrument.weights).forEach(key => {
         instrument.weights[key] = Math.max(0.5, Math.min(2.0, instrument.weights[key]));
     });
+    console.log(`New weights for ${symbol}: LDF=${instrument.weights.ldf.toFixed(2)}, RECENCY=${instrument.weights.recency.toFixed(2)}, PF=${instrument.weights.pf.toFixed(2)}`);
     saveWeights();
-}
-
-function checkPortfolioRisk() {
-    const cooledDownCount = Object.values(instruments).filter(inst => inst.cooldownUntil && Date.now() < inst.cooldownUntil).length;
-    const newMode = cooledDownCount >= RISK_OFF_THRESHOLD ? 'RISK_OFF' : 'NORMAL';
-    if (newMode !== portfolioRiskMode) {
-        portfolioRiskMode = newMode;
-        console.log(`PORTFOLIO RISK MODE CHANGED TO: ${portfolioRiskMode}.`);
-    }
 }
 
 // --- Start the Engine ---
 initializeInstruments();
 connectToDeriv();
-setInterval(checkPortfolioRisk, 10000);
 
 server.listen(process.env.PORT || 8080, () => {
-    console.log(`Medusir 3.1 Backend is running on port ${process.env.PORT || 8080}`);
+    console.log(`Medusir 3.2 Backend is running on port ${process.env.PORT || 8080}`);
 });
 
