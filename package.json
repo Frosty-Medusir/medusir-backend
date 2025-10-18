@@ -1,0 +1,15 @@
+{
+  "name": "medusir-backend",
+  "version": "5.1.0",
+  "description": "Backend for Medusir Signal App",
+  "main": "backend.js",
+  "scripts": {
+    "start": "node backend.js"
+  },
+  "dependencies": {
+    "ws": "^8.13.0"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
